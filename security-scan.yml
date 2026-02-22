@@ -1,0 +1,240 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install semgrep
+
+      - name: Run Security Scan
+        run: |
+          mkdir -p security-results
+
+          # Run semgrep for security patterns
+          semgrep --config=auto --json --output=security-results/semgrep.json . || true
+
+          # Also do basic security checks
+          echo "Checking for common security issues..."
+
+          # Check for hardcoded secrets
+          echo "{
+            \"findings\": []
+          }" > security-results/findings.json
+
+          node << 'EOF'
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+
+          let findings = [];
+
+          // Try to parse semgrep results
+          try {
+            const semgrep = JSON.parse(fs.readFileSync('security-results/semgrep.json', 'utf8'));
+            if (semgrep.results) {
+              findings = semgrep.results.map(r => ({
+                file: r.path,
+                line: r.start.line,
+                title: r.message,
+                severity: r.extra.severity || 'MEDIUM',
+                code: r.lines.slice(0, 3).join('\n')
+              }));
+            }
+          } catch (e) {
+            console.log('No semgrep results');
+          }
+
+          // Add custom checks
+          try {
+            const files = execSync('git ls-files', { encoding: 'utf8' }).split('\n').filter(Boolean);
+
+            files.forEach(file => {
+              try {
+                const content = fs.readFileSync(file, 'utf8');
+
+                // Check for API keys
+                if (content.match(/sk_live_|sk_test_|ghp_|gho_|ghu_/)) {
+                  findings.push({
+                    file: file,
+                    line: 1,
+                    title: 'Potential hardcoded credential detected',
+                    severity: 'HIGH',
+                    code: 'Contains sensitive token pattern'
+                  });
+                }
+
+                // Check for eval usage
+                if (content.match(/\beval\s*\(/)) {
+                  findings.push({
+                    file: file,
+                    line: content.split('\n').findIndex(l => l.match(/eval\s*\(/)) + 1,
+                    title: 'Use of eval() detected',
+                    severity: 'HIGH',
+                    code: 'eval() can execute arbitrary code'
+                  });
+                }
+
+                // Check for SQL injection patterns
+                if (content.match(/["\`].*\$\{.*\}.*["\`]/)) {
+                  findings.push({
+                    file: file,
+                    line: 1,
+                    title: 'Possible SQL injection vulnerability',
+                    severity: 'CRITICAL',
+                    code: 'Template literals in SQL queries'
+                  });
+                }
+
+              } catch (e) {
+                // Skip files that can't be read
+              }
+            });
+          } catch (e) {
+            console.log('Error scanning files:', e.message);
+          }
+
+          // Remove duplicates and limit
+          const seen = new Set();
+          const unique = findings.filter(f => {
+            const key = `${f.file}:${f.title}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          }).slice(0, 15); // Max 15 findings
+
+          // Prioritize CRITICAL and HIGH
+          const criticalAndHigh = unique.filter(f =>
+            f.severity === 'CRITICAL' || f.severity === 'HIGH'
+          );
+
+          fs.writeFileSync('security-results/final-findings.json', JSON.stringify({
+            total: unique.length,
+            critical: criticalAndHigh.filter(f => f.severity === 'CRITICAL').length,
+            high: criticalAndHigh.filter(f => f.severity === 'HIGH').length,
+            findings: criticalAndHigh
+          }, null, 2));
+
+          console.log(`Found ${criticalAndHigh.length} critical/high issues`);
+          EOF
+
+      - name: Create Summary
+        id: summary
+        run: |
+          node << 'EOF'
+          const fs = require('fs');
+          const data = JSON.parse(fs.readFileSync('security-results/final-findings.json', 'utf8'));
+
+          let markdown = `## 🔒 Security Scan Results\n\n`;
+          markdown += `**Repository:** ${{ github.repository }}\n`;
+          markdown += `**Commit:** \`${{ github.sha }}\`\n\n`;
+
+          markdown += `### Summary\n\n`;
+          markdown += `- **Critical:** ${data.critical}\n`;
+          markdown += `- **High:** ${data.high}\n`;
+          markdown += `- **Total Issues Found:** ${data.total}\n\n`;
+
+          if (data.findings.length > 0) {
+            markdown += `### Findings Requiring Attention\n\n`;
+
+            data.findings.forEach((f, i) => {
+              const emoji = f.severity === 'CRITICAL' ? '🚨' : '⚠️';
+              markdown += `${emoji} **${f.title}**\n`;
+              markdown += `- **File:** \`${f.file}\`\n`;
+              markdown += `- **Line:** ${f.line}\n`;
+              markdown += `- **Severity:** ${f.severity}\n`;
+              if (f.code) {
+                markdown += `- **Details:** ${f.code}\n`;
+              }
+              markdown += `\n`;
+            });
+          } else {
+            markdown += `✅ No critical or high severity issues found!\n\n`;
+          }
+
+          markdown += `\n---\n*Automated security scan*`;
+
+          fs.writeFileSync('security-results/report.md', markdown);
+          console.log(markdown);
+          EOF
+
+      - name: Create Pull Request
+        if: github.event_name == 'push'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          title: "🔒 Security Scan - Findings Detected"
+          body-path: security-results/report.md
+          branch: security-fixes-${{ github.run_number }}
+          delete-branch: true
+          labels: security,automated
+
+      - name: Create Issue for Critical Findings
+        if: github.event_name == 'push'
+        run: |
+          node << 'EOF'
+          const fs = require('fs');
+          const data = JSON.parse(fs.readFileSync('security-results/final-findings.json', 'utf8'));
+
+          if (data.critical > 0) {
+            const { execSync } = require('child_process');
+
+            let body = `🚨 **Critical security vulnerabilities were detected!**\n\n`;
+            body += `**Repository:** ${{ github.repository }}\n`;
+            body += `**Commit:** \`${{ github.sha }}\`\n\n`;
+            body += `### Critical Issues Found: ${data.critical}\n\n`;
+
+            data.findings.filter(f => f.severity === 'CRITICAL').forEach(f => {
+              body += `- **${f.title}** in \`${f.file}\` (line ${f.line})\n`;
+            });
+
+            body += `\nPlease review the security scan PR for detailed findings and fixes.`;
+
+            // Check if similar issue already exists
+            try {
+              const existing = execSync('gh issue list --label "security,critical" --state open --json title,number --jq .', {
+                encoding: 'utf8',
+                env: { ...process.env, GH_TOKEN: process.env.GITHUB_TOKEN }
+              });
+
+              if (existing.trim()) {
+                console.log('Critical issue already exists, skipping creation');
+                process.exit(0);
+              }
+            } catch (e) {
+              // No existing issues, proceed
+            }
+
+            // Create the issue
+            execSync(`gh issue create --title "🚨 Critical Security Issues Detected" --body "${body.replace(/"/g, '\\"')}" --label "security,critical"`, {
+              env: { ...process.env, GH_TOKEN: process.env.GITHUB_TOKEN }
+            });
+
+            console.log('Created critical security issue');
+          }
+          EOF
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-scan-results
+          path: security-results/
